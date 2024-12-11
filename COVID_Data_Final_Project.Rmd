@@ -1,0 +1,468 @@
+---
+title: "COVID Data Final Project (Echo = False)"
+author: "Benjamin Janes"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load(flextable, lubridate, gt, tidyverse, ggplot2, usmap, maps, gganimate, viridis, gifski, rnaturalearth, rnaturalearthdata, scales, forecast, kableExtra)
+```
+
+Import COVID Data
+
+```{r echo = false}
+url_in <- "https://github.com/CSSEGISandData/COVID-19/raw/refs/heads/master/csse_covid_19_data/csse_covid_19_time_series/"
+
+filenames <- 
+  c("time_series_19-covid-Confirmed.csv",
+    "time_series_covid19_confirmed_US.csv",
+    "time_series_covid19_confirmed_global.csv",
+    "time_series_covid19_deaths_US.csv",
+    "time_series_covid19_deaths_global.csv")
+urls <- str_c(url_in, filenames)
+
+global_cases <- read_csv(urls[3])
+global_deaths <- read_csv(urls[5])
+us_cases <- read_csv(urls[2])
+us_deaths <- read_csv(urls[4])
+```
+
+Create tidy data sets
+
+
+```{r echo = false}
+global_cases_wrangle <- global_cases %>%
+  pivot_longer(cols = -c(`Province/State`, `Country/Region`, Lat, Long),
+               names_to = "date",
+               values_to = "cases") %>%
+  mutate(date = mdy(date)) %>%
+  select(-c(Lat, Long))
+```
+
+```{r echo = false}
+global_deaths_wrangle <- global_deaths %>%
+  pivot_longer(cols = -c(`Province/State`, `Country/Region`, Lat, Long),
+               names_to = "date",
+               values_to = "deaths") %>%
+  mutate(date = mdy(date)) %>%
+  select(-c(Lat, Long))
+#  filter(deaths != 0)
+```
+
+```{r echo = false}
+us_cases_wrangle <- us_cases %>%
+  select(-c(UID, iso2, iso3,code3, FIPS, Lat, Long_)) %>%
+  rename(City = Admin2, State = Province_State, Country = Country_Region) %>%
+  pivot_longer(cols = -c(City, State, Country, Combined_Key),
+               names_to = "date",
+               values_to = "cases") %>%
+  mutate(date = mdy(date))
+```
+
+```{r echo = false}
+us_deaths_wrangle <- us_deaths %>%
+  select(-c(UID, iso2, iso3,code3, FIPS, Lat, Long_)) %>%
+  rename(City = Admin2, State = Province_State, Country = Country_Region) %>%
+  pivot_longer(cols = -c(City, State, Country, Combined_Key, Population),
+               names_to = "date",
+               values_to = "deaths") %>%
+  mutate(date = mdy(date))
+#  filter(deaths != 0)
+```
+
+```{r echo = false}
+global <- global_cases_wrangle %>%
+  full_join(global_deaths_wrangle)
+```
+
+```{r echo = false}
+us <- us_cases_wrangle %>%
+  full_join(us_deaths_wrangle, by = c("City", "State", "Country", "Combined_Key", "date"))
+```
+
+1. Insights from the US Data Visualization of Observed Cases and Deaths
+
+The visualization of observed daily cases and deaths in the United States reveals critical trends in the progression of the COVID-19 pandemic. Peaks correspond to significant waves of infections, driven by new variants, holiday gatherings, or waning immunity. The lag between case surges and death spikes highlights the progression of the disease and its impact on healthcare resources.
+
+The ARIMA model provided a reliable forecast of daily new deaths in the U.S., capturing seasonality and trend changes. Such forecasts can assist first responders by:
+
+a. Anticipating resource needs (e.g., ICU beds and staff allocation).
+b. Guiding policy interventions during surges.
+c. Supporting proactive measures like emergency planning and supply chain management.
+
+```{r echo = false}
+# Load the dataset
+data <- us
+
+# Convert date to Date format
+data$date <- as.Date(data$date, format = "%m/%d/%y")
+
+# Ensure daily new cases and new deaths calculation if they are cumulative
+data <- data %>%
+  group_by(Country, State) %>%
+  arrange(date) %>%
+  mutate(
+    new_cases = cases - lag(cases, default = 0),
+    new_deaths = deaths - lag(deaths, default = 0)
+  ) %>%
+  ungroup()
+
+# Filter the dataset for the US starting from 2020 and calculate daily new deaths and new cases
+us_data <- data %>%
+  filter(Country == "US", date >= as.Date("2020-01-01")) %>%
+  group_by(date) %>%
+  summarize(
+    Total_New_Deaths = sum(new_deaths, na.rm = TRUE),
+    Total_New_Cases = sum(new_cases, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Prepare data for faceting
+us_data_long <- us_data %>%
+  pivot_longer(
+    cols = c(Total_New_Cases, Total_New_Deaths),
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+# Visualize the observed data with facets
+library(ggplot2)
+
+ggplot(us_data_long, aes(x = date, y = Value, color = Metric)) +
+  geom_line() +
+  facet_wrap(~Metric, ncol = 1, scales = "free_y") +
+  ggtitle("Observed Daily New Cases and Deaths in the US") +
+  xlab("Date") +
+  ylab("Count") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Fit the ARIMA model for new deaths
+library(forecast)
+arima_model_deaths <- auto.arima(us_data$Total_New_Deaths, seasonal = TRUE, stepwise = TRUE, approximation = FALSE)
+
+# Print the model summary
+summary(arima_model_deaths)
+
+# Forecast the next 30 days for new deaths
+forecast_deaths <- forecast(arima_model_deaths, h = 30)
+
+# Create a dataframe for the forecast with actual dates
+forecast_deaths_df <- data.frame(
+  Date = seq(max(us_data$date) + 1, by = "day", length.out = 30),
+  Forecast = forecast_deaths$mean,
+  Lower_80 = forecast_deaths$lower[, 1],
+  Upper_80 = forecast_deaths$upper[, 1],
+  Lower_95 = forecast_deaths$lower[, 2],
+  Upper_95 = forecast_deaths$upper[, 2]
+)
+
+# Plot the forecast with actual dates
+library(ggplot2)
+ggplot() +
+  geom_line(data = us_data, aes(x = date, y = Total_New_Deaths, color = "Observed")) +
+  geom_line(data = forecast_deaths_df, aes(x = Date, y = Forecast, color = "Forecast")) +
+  geom_ribbon(data = forecast_deaths_df, aes(x = Date, ymin = Lower_95, ymax = Upper_95), fill = "blue", alpha = 0.2) +
+  geom_ribbon(data = forecast_deaths_df, aes(x = Date, ymin = Lower_80, ymax = Upper_80), fill = "lightblue", alpha = 0.4) +
+  ggtitle("ARIMA Forecast for Daily New Deaths in the US") +
+  xlab("Date") +
+  ylab("New Deaths") +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+```
+
+
+2. Observations from the Cumulative Cases and Deaths Heatmaps in the U.S.
+The cumulative heatmaps highlighted geographic disparities in the pandemic’s impact. Regions with high cumulative cases and deaths relative to population percentages may indicate vulnerabilities such as healthcare infrastructure limitations, demographic factors, or varying levels of compliance with public health guidelines.
+
+```{r echo = false}
+# Load the dataset
+data <- us
+
+# Convert date to Date format
+data$date <- as.Date(data$date, format = "%m/%d/%y")
+
+# Ensure cumulative cases and deaths are converted to daily values
+data <- data %>%
+  group_by(Country, State) %>%
+  arrange(date) %>%
+  mutate(
+    daily_cases = cases - lag(cases, default = 0),
+    daily_deaths = deaths - lag(deaths, default = 0)
+  ) %>%
+  ungroup()
+
+# Filter the dataset for the US starting from 2020 and calculate cumulative cases and deaths
+state_cumulative_data <- data %>%
+  filter(Country == "US", date >= as.Date("2020-01-01")) %>%
+  group_by(State, date) %>%
+  summarize(
+    Cumulative_Cases = sum(cases, na.rm = TRUE),
+    Cumulative_Deaths = sum(deaths, na.rm = TRUE),
+    Population = signif(max(Population, na.rm = TRUE), 6),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    Cases_Percentage = round((Cumulative_Cases / Population) * 100, 2),
+    Deaths_Percentage = round((Cumulative_Deaths / Population) * 100, 2)
+  )
+
+# Get US states map data
+us_states <- map_data("state")
+
+# Get outer boundary of the United States
+us_outer_boundary <- us_states %>%
+  group_by(group) %>%
+  filter(n() > 1)
+
+# Merge COVID data with US states map data
+state_cumulative_data <- state_cumulative_data %>%
+  mutate(State = tolower(State))  # Ensure state names are lowercase to match map data
+
+merged_data <- left_join(us_states, state_cumulative_data, by = c("region" = "State"))
+
+# Create the base heatmap visualization
+us_map <- ggplot(merged_data, aes(x = long, y = lat, group = group, fill = Cases_Percentage)) +
+  geom_polygon(color = "white") +  # Remove internal state borders
+  geom_path(data = us_outer_boundary, aes(x = long, y = lat, group = group), color = "white", size = 0.7, inherit.aes = FALSE) +  # Add outer US outline
+  scale_fill_gradientn(
+    name = "% of Population",
+    colors = c("white", "yellow", "lightblue", "lightgreen", "orange", "red"),
+    values = scales::rescale(c(0, 0.01, 0.05, 0.1, 0.5, 1)),
+    na.value = "grey50"  # Handle missing values
+  ) +
+  labs(
+    title = "Cumulative Cases as % of Population by State: {frame_time}",
+    subtitle = "Progression Over Time",
+    caption = "Source: US Dataset"
+  ) +
+  coord_fixed(1.3) +  # Fix aspect ratio
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    legend.position = "right"
+  )
+
+# Add animation to the heatmap over time
+animated_map <- us_map +
+  transition_time(date) +  # Animate by day
+  labs(title = "Cumulative Cases as % of Population by State: {frame_time}")
+
+# Render the animation with an end pause
+animate(animated_map, nframes = 100, fps = 5, end_pause = 20, renderer = gifski_renderer())
+
+# Save the animation as a GIF
+anim_save("covid_US_newcases_heatmap_percentage_animation.gif", animation = last_animation())
+```
+
+
+
+```{r echo = false}
+# Load the dataset
+data <- us
+
+# Convert date to Date format
+data$date <- as.Date(data$date, format = "%m/%d/%y")
+
+# Ensure cumulative cases and deaths are converted to daily values
+data <- data %>%
+  group_by(Country, State) %>%
+  arrange(date) %>%
+  mutate(
+    daily_cases = cases - lag(cases, default = 0),
+    daily_deaths = deaths - lag(deaths, default = 0)
+  ) %>%
+  ungroup()
+
+# Filter the dataset for the US starting from 2020 and calculate cumulative cases and deaths
+state_cumulative_data <- data %>%
+  filter(Country == "US", date >= as.Date("2020-01-01")) %>%
+  group_by(State, date) %>%
+  summarize(
+    Cumulative_Cases = sum(cases, na.rm = TRUE),
+    Cumulative_Deaths = sum(deaths, na.rm = TRUE),
+    Population = signif(max(Population, na.rm = TRUE), 6),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    Cases_Percentage = round((Cumulative_Cases / Population) * 100, 2),
+    Deaths_Percentage = round((Cumulative_Deaths / Population) * 100, 2)
+  )
+
+# Get US states map data
+us_states <- map_data("state")
+
+# Get outer boundary of the United States
+us_outer_boundary <- us_states %>%
+  group_by(group) %>%
+  filter(n() > 1)
+
+# Merge COVID data with US states map data
+state_cumulative_data <- state_cumulative_data %>%
+  mutate(State = tolower(State))  # Ensure state names are lowercase to match map data
+
+merged_data <- left_join(us_states, state_cumulative_data, by = c("region" = "State"))
+
+# Create the base heatmap visualization
+us_map <- ggplot(merged_data, aes(x = long, y = lat, group = group, fill = Deaths_Percentage)) +
+  geom_polygon(color = "white") +  # Remove internal state borders
+  geom_path(data = us_outer_boundary, aes(x = long, y = lat, group = group), color = "white", size = 0.7, inherit.aes = FALSE) +  # Add outer US outline
+  scale_fill_gradientn(
+    name = "% of Population",
+    colors = c("white", "yellow", "lightblue", "lightgreen", "orange", "red"),
+    values = scales::rescale(c(0, 0.01, 0.05, 0.1, 0.5, 1)),
+    na.value = "grey50"  # Handle missing values
+  ) +
+  labs(
+    title = "Cumulative Deaths as % of Population by State: {frame_time}",
+    subtitle = "Progression Over Time",
+    caption = "Source: US Dataset"
+  ) +
+  coord_fixed(1.3) +  # Fix aspect ratio
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    legend.position = "right"
+  )
+
+# Add animation to the heatmap over time
+animated_map <- us_map +
+  transition_time(date) +  # Animate by day
+  labs(title = "Cumulative Deaths as % of Population by State: {frame_time}")
+
+# Render the animation with an end pause
+animate(animated_map, nframes = 100, fps = 5, end_pause = 20, renderer = gifski_renderer())
+
+# Save the animation as a GIF
+anim_save("covid_US_heatmap_cumulative_deaths_percentage_animation.gif", animation = last_animation())
+
+
+```
+
+3. Insights from the Global Data Visualization of Observed Cases and Deaths
+The global visualization underscored uneven pandemic impacts across countries. Peaks reflect significant global waves, often correlating with the spread of variants like Delta and Omicron. It highlights regions with delayed case reporting and death surges, emphasizing the need for synchronized global efforts.
+
+The ARIMA forecast for global data demonstrated its adaptability to larger datasets. Potential applications include:
+
+a. Early warnings for emerging hotspots.
+b. Optimized distribution of global medical resources.
+c. Informing travel advisories and cross-border health policies.
+
+
+```{r echo = false}
+# Load the dataset
+data <- global
+
+# Convert date to Date format
+data$date <- as.Date(data$date)
+
+# Ensure daily new cases and new deaths calculation if they are cumulative
+data <- data %>%
+  arrange(date) %>%
+  group_by(`Country/Region`, `Province/State`) %>%
+  mutate(
+    new_cases = cases - lag(cases, default = 0),
+    new_deaths = deaths - lag(deaths, default = 0)
+  ) %>%
+  ungroup()
+
+# Check for unexpected values in new cases and new deaths
+data <- data %>%
+  mutate(
+    new_cases = ifelse(new_cases < 0, NA, new_cases),  # Remove negative values
+    new_deaths = ifelse(new_deaths < 0, NA, new_deaths)  # Remove negative values
+  )
+
+# Filter the dataset globally starting from 2020 and calculate daily new deaths and new cases
+global_data <- data %>%
+  filter(date >= as.Date("2020-01-01")) %>%
+  group_by(date) %>%
+  summarize(
+    Total_New_Deaths = sum(new_deaths, na.rm = TRUE),
+    Total_New_Cases = sum(new_cases, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Validate the aggregation results
+print(summary(global_data$Total_New_Deaths))
+print(summary(global_data$Total_New_Cases))
+
+# Prepare data for faceting
+global_data_long <- global_data %>%
+  pivot_longer(
+    cols = c(Total_New_Cases, Total_New_Deaths),
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+# Visualize the observed data with facets
+library(ggplot2)
+
+ggplot(global_data_long, aes(x = date, y = Value, color = Metric)) +
+  geom_line() +
+  facet_wrap(~Metric, ncol = 1, scales = "free_y") +
+  ggtitle("Observed Daily New Cases and Deaths Globally") +
+  xlab("Date") +
+  ylab("Count") +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Fit the ARIMA model for new deaths
+library(forecast)
+arima_model_deaths <- auto.arima(global_data$Total_New_Deaths, seasonal = TRUE, stepwise = TRUE, approximation = FALSE)
+
+# Print the model summary
+summary(arima_model_deaths)
+
+# Forecast the next 30 days for new deaths
+forecast_deaths <- forecast(arima_model_deaths, h = 30)
+
+# Create a dataframe for the forecast with actual dates
+forecast_deaths_df <- data.frame(
+  Date = seq(max(global_data$date) + 1, by = "day", length.out = 30),
+  Forecast = forecast_deaths$mean,
+  Lower_80 = forecast_deaths$lower[, 1],
+  Upper_80 = forecast_deaths$upper[, 1],
+  Lower_95 = forecast_deaths$lower[, 2],
+  Upper_95 = forecast_deaths$upper[, 2]
+)
+
+# Plot the forecast with actual dates
+ggplot() +
+  geom_line(data = global_data, aes(x = date, y = Total_New_Deaths, color = "Observed")) +
+  geom_line(data = forecast_deaths_df, aes(x = Date, y = Forecast, color = "Forecast")) +
+  geom_ribbon(data = forecast_deaths_df, aes(x = Date, ymin = Lower_95, ymax = Upper_95), fill = "blue", alpha = 0.2) +
+  geom_ribbon(data = forecast_deaths_df, aes(x = Date, ymin = Lower_80, ymax = Upper_80), fill = "lightblue", alpha = 0.4) +
+  ggtitle("ARIMA Forecast for Daily New Deaths Globally") +
+  xlab("Date") +
+  ylab("New Deaths") +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+
+```
+
+4. Potential Areas of Bias
+a. Data Reporting: Inconsistent or incomplete reporting by countries or states introduces bias.
+b. Population Differences: Data normalized by population does not account for demographic factors like age or underlying health conditions.
+c. Forecast Assumptions: ARIMA relies on historical patterns, which may not predict unprecedented events (e.g., new variants or sudden intervention measures).
+
+5. Potential Areas of Concern
+a. Underreporting: Many regions might underreport due to limited resources or political considerations.
+b. Model Limitations: ARIMA models do not incorporate external variables like vaccine effectiveness or behavioral changes.
+c. Ethical Use of Data: Ensuring equity in resource allocation and decision-making based on predictive data is crucial.
+
+6. Key Questions and Potential Areas to Explore
+a. How can real-time data reporting be improved globally?
+b. What additional factors (e.g., vaccination rates, mobility data) should be incorporated into forecasting models?
+c. How do interventions (e.g., mask mandates, lockdowns) alter the validity of ARIMA models?
+d. What lessons can be learned to enhance preparedness for future pandemics?
+
+7. Summary
+The analysis integrates data visualization and ARIMA modeling to uncover trends and make informed predictions about COVID-19's impact. While the tools provided valuable insights, addressing biases and limitations is critical for actionable outcomes. These findings emphasize the need for global coordination, improved data collection, and equity-focused strategies to mitigate health crises effectively.
